@@ -3,105 +3,180 @@ import { Notification, NotificationResult } from './types';
 export class NotificationQueue {
   private queue: Notification[] = [];
   private processing = false;
+  private processingLock = Promise.resolve();
   private processedIds: Set<string> = new Set();
-  private retryCount = 0;
   private maxRetries = 3;
+  private retryCountPerNotification: Map<string, number> = new Map();
 
-  // BUG #1: Shared mutable state - this cache is never cleared and grows indefinitely
-  private resultCache: Map<string, NotificationResult> = new Map();
+  // FIX: Cache with TTL and max size to prevent memory leaks
+  private resultCache: Map<string, { result: NotificationResult; timestamp: number }> = new Map();
+  private readonly CACHE_TTL_MS = 3600000; // 1 hour
+  private readonly MAX_CACHE_SIZE = 10000;
 
-  // BUG #2: Event listeners array that accumulates without cleanup
-  private listeners: Array<(result: NotificationResult) => void> = [];
+  // FIX: WeakRef or proper listener management
+  private listeners: Set<(result: NotificationResult) => void> = new Set();
 
-  constructor(private readonly processor: (notification: Notification) => Promise<boolean>) {}
+  constructor(private readonly processor: (notification: Notification) => Promise<boolean>) {
+    // FIX: Periodic cache cleanup
+    setInterval(() => this.cleanupCache(), this.CACHE_TTL_MS / 4);
+  }
 
-  addListener(callback: (result: NotificationResult) => void) {
-    // BUG #3: No deduplication, same listener can be added multiple times
-    this.listeners.push(callback);
+  addListener(callback: (result: NotificationResult) => void): () => void {
+    // FIX: Use Set to prevent duplicates, return unsubscribe function
+    this.listeners.add(callback);
+    return () => this.listeners.delete(callback);
+  }
+
+  removeListener(callback: (result: NotificationResult) => void): void {
+    this.listeners.delete(callback);
   }
 
   async enqueue(notification: Notification): Promise<void> {
-    // BUG #4: No validation of notification object
+    // FIX: Validate notification object
+    if (!notification || !notification.id || !notification.userId || !notification.message) {
+      throw new Error('Invalid notification: missing required fields');
+    }
+
+    // FIX: Check for duplicates before enqueueing
+    if (this.processedIds.has(notification.id)) {
+      return;
+    }
+
     this.queue.push(notification);
 
-    // BUG #5: Fire-and-forget - we don't await this, errors are swallowed
-    this.processQueue();
+    // FIX: Properly await queue processing
+    await this.processQueue();
   }
 
   async enqueueBatch(notifications: Notification[]): Promise<void> {
-    // BUG #6: Direct mutation of input array by sorting it
-    notifications.sort((a, b) => b.priority - a.priority);
+    // FIX: Create a copy before sorting to avoid mutating input
+    const sortedNotifications = [...notifications].sort((a, b) => b.priority - a.priority);
 
-    for (const notification of notifications) {
-      // BUG #7: Each enqueue triggers processQueue, causing race conditions
-      this.enqueue(notification);
+    // FIX: Mark all as pending first to prevent race conditions
+    for (const notification of sortedNotifications) {
+      if (!notification || !notification.id) continue;
+      this.queue.push(notification);
     }
+
+    // FIX: Single call to process the queue
+    await this.processQueue();
   }
 
   private async processQueue(): Promise<void> {
-    // BUG #8: This check is not atomic - race condition between check and set
-    if (this.processing) {
-      return;
-    }
-    this.processing = true;
-
-    while (this.queue.length > 0) {
-      const notification = this.queue.shift()!;
-
-      // BUG #9: Checking processedIds but adding to it AFTER processing
-      // This allows duplicates if the same notification is enqueued twice quickly
-      if (this.processedIds.has(notification.id)) {
-        continue;
+    // FIX: Use a lock mechanism to prevent race conditions
+    this.processingLock = this.processingLock.then(async () => {
+      if (this.processing) {
+        return;
       }
+      this.processing = true;
 
       try {
-        const success = await this.processor(notification);
+        while (this.queue.length > 0) {
+          const notification = this.queue.shift()!;
 
-        // BUG #10: Adding to processedIds only on success path
-        if (success) {
+          // FIX: Check processed BEFORE processing and add immediately
+          if (this.processedIds.has(notification.id)) {
+            continue;
+          }
           this.processedIds.add(notification.id);
+
+          const retryCount = this.retryCountPerNotification.get(notification.id) || 0;
+
+          try {
+            const success = await this.processor(notification);
+
+            const result: NotificationResult = {
+              success,
+              notificationId: notification.id,
+              timestamp: new Date(),
+            };
+
+            // FIX: Cache with timestamp for TTL
+            this.cacheResult(notification.id, result);
+
+            // FIX: Notify listeners asynchronously to not block the queue
+            this.notifyListenersAsync(result);
+
+          } catch (error) {
+            // FIX: Per-notification retry count
+            if (retryCount < this.maxRetries) {
+              this.retryCountPerNotification.set(notification.id, retryCount + 1);
+              this.processedIds.delete(notification.id); // Allow reprocessing
+              this.queue.push(notification); // Add to end, not front
+            } else {
+              // FIX: Clean up retry count after max retries
+              this.retryCountPerNotification.delete(notification.id);
+
+              const result: NotificationResult = {
+                success: false,
+                notificationId: notification.id,
+                timestamp: new Date(),
+                error: error instanceof Error ? error.message : 'Unknown error',
+              };
+              this.cacheResult(notification.id, result);
+              this.notifyListenersAsync(result);
+            }
+          }
         }
+      } finally {
+        this.processing = false;
+      }
+    });
 
-        const result: NotificationResult = {
-          success,
-          notificationId: notification.id,
-          timestamp: new Date(),
-        };
+    await this.processingLock;
+  }
 
-        // BUG #11: Caching ALL results forever (memory leak)
-        this.resultCache.set(notification.id, result);
-
-        // BUG #12: Notifying listeners synchronously can block the queue
-        this.listeners.forEach(listener => listener(result));
-
-      } catch (error) {
-        // BUG #13: Retry logic with off-by-one error - retries maxRetries+1 times
-        if (this.retryCount <= this.maxRetries) {
-          this.retryCount++;
-          // BUG #14: Re-adding to front of queue but retryCount is global, not per-notification
-          this.queue.unshift(notification);
-        } else {
-          // BUG #15: retryCount is never reset after max retries reached
-          const result: NotificationResult = {
-            success: false,
-            notificationId: notification.id,
-            timestamp: new Date(),
-            error: error instanceof Error ? error.message : 'Unknown error',
-          };
-          this.resultCache.set(notification.id, result);
-        }
+  private cacheResult(notificationId: string, result: NotificationResult): void {
+    // FIX: Enforce max cache size
+    if (this.resultCache.size >= this.MAX_CACHE_SIZE) {
+      const oldestKey = this.resultCache.keys().next().value;
+      if (oldestKey) {
+        this.resultCache.delete(oldestKey);
       }
     }
+    this.resultCache.set(notificationId, { result, timestamp: Date.now() });
+  }
 
-    this.processing = false;
+  private notifyListenersAsync(result: NotificationResult): void {
+    // FIX: Use setImmediate/setTimeout to not block
+    setTimeout(() => {
+      this.listeners.forEach(listener => {
+        try {
+          listener(result);
+        } catch (e) {
+          console.error('Listener error:', e);
+        }
+      });
+    }, 0);
+  }
+
+  private cleanupCache(): void {
+    const now = Date.now();
+    for (const [key, value] of this.resultCache.entries()) {
+      if (now - value.timestamp > this.CACHE_TTL_MS) {
+        this.resultCache.delete(key);
+      }
+    }
   }
 
   getResult(notificationId: string): NotificationResult | undefined {
-    return this.resultCache.get(notificationId);
+    const cached = this.resultCache.get(notificationId);
+    return cached?.result;
   }
 
-  // BUG #16: No method to clear cache or remove listeners (resource leak)
   getQueueSize(): number {
     return this.queue.length;
+  }
+
+  // FIX: Add cleanup method
+  clearCache(): void {
+    this.resultCache.clear();
+    this.processedIds.clear();
+    this.retryCountPerNotification.clear();
+  }
+
+  // FIX: Add method to clear all listeners
+  clearListeners(): void {
+    this.listeners.clear();
   }
 }

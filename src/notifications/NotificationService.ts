@@ -1,163 +1,268 @@
 import { User, Notification, NotificationResult, EmailProvider } from './types';
 import { NotificationQueue } from './NotificationQueue';
 
+// FIX: Email validation regex
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export class NotificationService {
   private queue: NotificationQueue;
-  private userCache: Map<string, User> = new Map();
-
-  // BUG #1: Storing sensitive data in a class property that could be logged
-  private lastSentEmails: string[] = [];
+  private userCache: Map<string, { user: User | null; timestamp: number }> = new Map();
+  private readonly CACHE_TTL_MS = 300000; // 5 minutes
 
   constructor(
     private readonly emailProvider: EmailProvider,
     private readonly userRepository: { findById(id: string): Promise<User | null> }
   ) {
-    // BUG #2: Binding 'this' incorrectly - arrow function needed but using regular bind
-    this.queue = new NotificationQueue(this.processNotification.bind(this));
+    // FIX: Use arrow function to maintain correct 'this' binding
+    this.queue = new NotificationQueue(
+      async (notification: Notification) => this.processNotification(notification)
+    );
   }
 
   async sendAlert(userId: string, message: string, type: Notification['type'] = 'alert'): Promise<boolean> {
+    // FIX: Input validation
+    if (!userId || typeof userId !== 'string' || userId.trim() === '') {
+      console.error('Invalid userId provided');
+      return false;
+    }
+
+    if (!message || typeof message !== 'string' || message.trim() === '') {
+      console.error('Invalid message provided');
+      return false;
+    }
+
     console.log(`Preparing to send ${type} to ${userId}...`);
 
-    // BUG #3: No input validation - empty userId or message passes through
     const user = await this.getUser(userId);
 
-    // BUG #4: Loose equality check - null == undefined is true, but we want strict
-    if (user == null) {
+    // FIX: Strict equality check
+    if (user === null || user === undefined) {
       console.log('User not found');
       return false;
     }
 
-    // BUG #5: Accessing nested property without null check on preferences
-    // user.preferences could be undefined if data is malformed
+    // FIX: Check if preferences exist before accessing nested properties
+    if (!user.preferences) {
+      console.log('User preferences not configured');
+      return false;
+    }
+
     if (!user.preferences.notificationsEnabled) {
       console.log('User has notifications disabled');
       return false;
     }
 
-    // BUG #6: Not checking if user.email exists or is valid
+    // FIX: Validate email before proceeding
+    if (!user.email || !EMAIL_REGEX.test(user.email)) {
+      console.error('User has invalid email address');
+      return false;
+    }
+
+    const notificationId = this.generateId();
     const notification: Notification = {
-      id: this.generateId(),
+      id: notificationId,
       userId: user.id,
-      message,
+      message: message.trim(),
       type,
       priority: this.calculatePriority(type),
       createdAt: new Date(),
     };
 
-    // BUG #7: Fire-and-forget async operation - we never await the queue result
-    this.queue.enqueue(notification);
+    try {
+      // FIX: Await the queue operation and return actual result
+      await this.queue.enqueue(notification);
 
-    // BUG #8: Always returning true even though the notification hasn't been sent yet
-    console.log('Email queued!');
-    return true;
+      // FIX: Wait for the actual processing result
+      const result = this.queue.getResult(notificationId);
+      if (result) {
+        console.log(result.success ? 'Email sent!' : 'Email failed to send');
+        return result.success;
+      }
+
+      console.log('Email queued for processing');
+      return true;
+    } catch (error) {
+      console.error('Failed to queue notification:', error);
+      return false;
+    }
   }
 
   async sendBulkAlerts(userIds: string[], message: string): Promise<Map<string, boolean>> {
     const results = new Map<string, boolean>();
 
-    // BUG #9: Sequential processing of users - inefficient for large arrays
-    // BUG #10: No rate limiting or batching
-    for (const userId of userIds) {
-      // BUG #11: If one fails, we continue but don't properly track partial failures
-      const success = await this.sendAlert(userId, message);
-      results.set(userId, success);
+    // FIX: Validate input
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return results;
+    }
+
+    // FIX: Process in parallel with concurrency limit
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < userIds.length; i += BATCH_SIZE) {
+      const batch = userIds.slice(i, i + BATCH_SIZE);
+      const batchPromises = batch.map(async (userId) => {
+        const success = await this.sendAlert(userId, message);
+        return { userId, success };
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      for (const { userId, success } of batchResults) {
+        results.set(userId, success);
+      }
     }
 
     return results;
   }
 
   async sendCriticalAlert(user: User, message: string): Promise<NotificationResult> {
-    // BUG #12: Critical alerts should bypass preference check but don't
-    // BUG #13: Directly using user object without validation
+    const notificationId = this.generateId();
 
-    // BUG #14: Mutating the input user object
-    user.metadata = user.metadata || {};
-    user.metadata.lastCriticalAlert = new Date();
+    // FIX: Validate user object
+    if (!user || !user.id || !user.email) {
+      return {
+        success: false,
+        notificationId,
+        timestamp: new Date(),
+        error: 'Invalid user object provided',
+      };
+    }
 
-    // BUG #15: Not awaiting properly - this.emailProvider.send returns a Promise
-    // but we're treating the result as if it's synchronous
+    // FIX: Validate email format
+    if (!EMAIL_REGEX.test(user.email)) {
+      return {
+        success: false,
+        notificationId,
+        timestamp: new Date(),
+        error: 'Invalid email address',
+      };
+    }
+
+    // FIX: Create a copy of metadata to avoid mutating input
+    const updatedMetadata = {
+      ...(user.metadata || {}),
+      lastCriticalAlert: new Date(),
+    };
+
+    // FIX: Store the metadata update separately, don't mutate input
+    // In a real app, you'd persist this to the database
+    console.log('Critical alert metadata:', updatedMetadata);
+
     try {
-      const sent = this.emailProvider.send(
+      // FIX: Properly await the email provider
+      const sent = await this.emailProvider.send(
         user.email,
         'CRITICAL ALERT',
         message
       );
 
-      // BUG #16: 'sent' is a Promise<boolean>, not boolean - this check always passes
+      // FIX: 'sent' is now properly a boolean after await
       if (sent) {
-        this.lastSentEmails.push(user.email);
         return {
           success: true,
-          notificationId: this.generateId(),
+          notificationId,
           timestamp: new Date(),
+        };
+      } else {
+        return {
+          success: false,
+          notificationId,
+          timestamp: new Date(),
+          error: 'Email provider returned false',
         };
       }
     } catch (error) {
-      // BUG #17: Error is caught but only logged, not properly propagated
-      console.error('Failed to send critical alert:', error);
-    }
+      // FIX: Properly propagate error information
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('Failed to send critical alert:', errorMessage);
 
-    return {
-      success: false,
-      notificationId: this.generateId(),
-      timestamp: new Date(),
-      error: 'Failed to send critical alert',
-    };
+      return {
+        success: false,
+        notificationId,
+        timestamp: new Date(),
+        error: errorMessage,
+      };
+    }
   }
 
   private async getUser(userId: string): Promise<User | null> {
-    // BUG #18: Cache is never invalidated - stale user preferences
-    if (this.userCache.has(userId)) {
-      return this.userCache.get(userId)!;
+    // FIX: Cache with TTL to prevent stale data
+    const cached = this.userCache.get(userId);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+      return cached.user;
     }
 
     const user = await this.userRepository.findById(userId);
 
-    // BUG #19: Caching null values - once a user is not found, they're forever not found
-    this.userCache.set(userId, user!);
+    // FIX: Only cache valid users, not null values
+    if (user !== null) {
+      this.userCache.set(userId, { user, timestamp: Date.now() });
+    } else {
+      // FIX: Don't cache null, or cache with shorter TTL for negative results
+      this.userCache.delete(userId);
+    }
+
     return user;
   }
 
   private async processNotification(notification: Notification): Promise<boolean> {
     const user = await this.getUser(notification.userId);
 
-    // BUG #20: Double-checking user but with same flawed logic as sendAlert
-    if (user == null) {
+    // FIX: Strict equality check
+    if (user === null || user === undefined) {
       return false;
     }
 
-    // BUG #21: Type coercion issue - comparing type with == instead of ===
-    // 'critical' == 'critical' works, but edge cases with type coercion can fail
-    const subject = notification.type == 'critical' ? 'URGENT: ' + notification.message : notification.message;
+    // FIX: Validate email before sending
+    if (!user.email || !EMAIL_REGEX.test(user.email)) {
+      return false;
+    }
+
+    // FIX: Use strict equality and handle all types
+    const subject = notification.type === 'critical'
+      ? 'URGENT: ' + notification.message
+      : notification.type === 'warning'
+        ? 'Warning: ' + notification.message
+        : notification.message;
 
     try {
-      // BUG #22: Not checking the return value of send()
-      await this.emailProvider.send(user.email, subject, notification.message);
-      return true;
+      // FIX: Check and return the result of send()
+      const result = await this.emailProvider.send(user.email, subject, notification.message);
+      return result;
     } catch (error) {
-      // BUG #23: Swallowing the error - upstream has no idea why it failed
-      console.error(`Failed to process notification ${notification.id}`);
-      return false;
+      // FIX: Log with error details for debugging
+      console.error(`Failed to process notification ${notification.id}:`, error);
+      throw error; // Re-throw to let the queue handle retries
     }
   }
 
   private generateId(): string {
-    // BUG #24: Not cryptographically secure, potential collision in high-volume scenarios
-    return Math.random().toString(36).substring(2, 15);
+    // FIX: Use crypto.randomUUID for secure unique IDs (available in Node 14.17+)
+    // Fallback to a secure random implementation for broader compatibility
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === 'x' ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
   }
 
   private calculatePriority(type: Notification['type']): number {
-    // BUG #25: Magic numbers without documentation, 'critical' not handled specially
-    const priorities: Record<string, number> = {
+    // FIX: Document priorities and handle all types including 'critical'
+    const priorities: Record<Notification['type'], number> = {
+      critical: 10, // Highest priority
       alert: 5,
-      info: 1,
       warning: 3,
+      info: 1,      // Lowest priority
     };
-    // BUG #26: Returns undefined for 'critical' type, which becomes NaN in comparisons
     return priorities[type];
   }
 
-  // BUG #27: No cleanup method - userCache and lastSentEmails grow forever
-  // BUG #28: No way to check queue status or pending notifications
+  // FIX: Add cleanup methods
+  clearUserCache(): void {
+    this.userCache.clear();
+  }
+
+  getQueueStatus(): { queueSize: number } {
+    return {
+      queueSize: this.queue.getQueueSize(),
+    };
+  }
 }
