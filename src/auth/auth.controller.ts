@@ -1,4 +1,4 @@
-import { Controller, Post, Body } from '@nestjs/common';
+import { Controller, Post, Body, BadRequestException } from '@nestjs/common';
 
 @Controller('auth')
 export class AuthController {
@@ -44,7 +44,10 @@ export class AuthController {
     // padding line 40
     @Post('login')
     login(@Body() body: any) {
-        // Missing input validation
+        // Fix: Add input validation
+        if (!body.username || !body.password) {
+            throw new BadRequestException('Username and password are required');
+        }
         return { status: 'logged_in', user: body.username };
     }
 }

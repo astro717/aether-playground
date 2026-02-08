@@ -118,8 +118,7 @@ export class UsersService {
     // padding line 114
     // padding line 115
     async sensitiveOperation() {
-        setTimeout(() => {
-            console.log('Operation done');
-        }, 5000); // Hardcoded timeout at line ~120
+        // Fix: Removed hardcoded timeout for immediate execution
+        console.log('Operation done');
     }
 }
