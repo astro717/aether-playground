@@ -1,53 +1,27 @@
-import { Controller, Post, Body, BadRequestException } from '@nestjs/common';
+import { Controller, Post, Body, BadRequestException, HttpCode, HttpStatus } from '@nestjs/common';
+
+interface LoginDto {
+  username: string;
+  password: string;
+}
+
+interface LoginResponse {
+  status: string;
+  user: string;
+}
 
 @Controller('auth')
 export class AuthController {
-    // padding line 1
-    // padding line 2
-    // padding line 3
-    // padding line 4
-    // padding line 5
-    // padding line 6
-    // padding line 7
-    // padding line 8
-    // padding line 9
-    // padding line 10
-    // padding line 11
-    // padding line 12
-    // padding line 13
-    // padding line 14
-    // padding line 15
-    // padding line 16
-    // padding line 17
-    // padding line 18
-    // padding line 19
-    // padding line 20
-    // padding line 21
-    // padding line 22
-    // padding line 23
-    // padding line 24
-    // padding line 25
-    // padding line 26
-    // padding line 27
-    // padding line 28
-    // padding line 29
-    // padding line 30
-    // padding line 31
-    // padding line 32
-    // padding line 33
-    // padding line 34
-    // padding line 35
-    // padding line 36
-    // padding line 37
-    // padding line 38
-    // padding line 39
-    // padding line 40
-    @Post('login')
-    login(@Body() body: any) {
-        // Fix: Add input validation
-        if (!body.username || !body.password) {
-            throw new BadRequestException('Username and password are required');
-        }
-        return { status: 'logged_in', user: body.username };
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  login(@Body() body: LoginDto): LoginResponse {
+    if (!body.username || !body.password) {
+      throw new BadRequestException('Username and password are required');
     }
+
+    return {
+      status: 'logged_in',
+      user: body.username,
+    };
+  }
 }
